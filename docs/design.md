@@ -12,13 +12,13 @@ Financial-services companies receive consumer complaints as free text and have t
 
 ## 2 Motivation
 
-**Why a system and not a notebook.** A notebook can show that a classifier separates complaint narratives by product once. The routing problem is not static: complaint mix and vocabulary change every month (the share of credit-reporting complaints in the CFPB data grew sharply over 2024–2026, new scam patterns appear, product taxonomies get renamed), so the model must be retrained on new periods, compared with the model in production, promoted under control, and watched while it serves. That is a pipeline, a registry, a service and a monitor — not a notebook.
+**Why a system and not a notebook.** A notebook can show that a classifier separates complaint narratives by product once. The routing problem is not static: complaint mix and vocabulary change every month (credit reporting grew to ≈ 88 % of all CFPB complaints in 2025; among published narratives its share was 75 % over 2023–2025 (58–81 % in every month from September 2024 to December 2025) and then fell to ≈ 4 % from January 2026, when narrative volume also dropped from 56–173 k to 10–22 k per month; new scam patterns appear, product taxonomies get renamed), so the model must be retrained on new periods, compared with the model in production, promoted under control, and watched while it serves. That is a pipeline, a registry, a service and a monitor — not a notebook.
 
 **Who consumes the predictions.**
 - *Primary consumer:* the intake / ticketing system of a complaint-handling desk (simulated in this course by a client script and, in Lab 5, by an agent). It calls `router-api` once per new complaint at submission time and uses the returned queue to place the ticket.
 - *Secondary consumer:* triage analysts, who see the predicted queue and the confidence on low-confidence tickets in the manual triage queue and confirm or correct them.
 
-**How often.** **Assumption:** traffic shaped like the CFPB's own intake volume in 2026 — roughly 640 000 complaints per month across all channels, i.e. ≈ 21 000 per day, ≈ 0.25 requests/s on average, with a 10× peak during business hours. The course demo runs at a fraction of this; the design budgets for 10 requests/s.
+**How often.** **Assumption:** traffic shaped like the CFPB's own intake volume in 2026 — 497 000–672 000 complaints per month in January–August 2026 (≈ 600 000 on average, counted in the archive, all rows with or without narrative), i.e. ≈ 20 000 per day, ≈ 0.23 requests/s on average, with a 10× peak during business hours. The course demo runs at a fraction of this; the design budgets for 10 requests/s.
 
 **What happens when predictions are wrong.**
 - *Wrong queue, high confidence:* the ticket lands with a team that cannot resolve it, is reassigned by hand, and the consumer's response clock (the CFPB expects a company response within 15 days) keeps running. This is the costly error, so the confidence threshold is tuned against it (§3, §5.4).
@@ -45,10 +45,10 @@ Three layers, kept apart. Optimizing vs satisficing is stated per metric.
 
 | # | Requirement |
 |---|---|
-| F1 | **Input:** `POST /route` with JSON `{complaint_id, narrative, company, state, submitted_via, tags, date_received}`; `narrative` is required, 20–20 000 characters. |
-| F2 | **Output:** `{complaint_id, queue, confidence, top3: [{queue, p}], route: "auto" | "manual", model_version, request_id}`. `route` is `auto` when `confidence ≥ threshold` (threshold stored with the model in the registry). |
+| F1 | **Input:** `POST /route` with JSON `{complaint_id, narrative, company, state, tags, date_received}`; `narrative` is required, 20–20 000 characters (2 387 of the 3.85 M archive narratives, 0.06 %, fall outside this range; such requests get `422` and the caller routes them to manual triage). |
+| F2 | **Output:** `{complaint_id, queue, confidence, top3: [{queue, p}], route: "auto" \| "manual", model_version, request_id}`. `route` is `auto` when `confidence ≥ threshold` (threshold stored with the model in the registry). |
 | F3 | **Who calls:** the intake system (service account with an API key); the Lab 5 agent with its own key. No anonymous access. |
-| F4 | `POST /feedback` `{complaint_id, true_queue, source: "analyst" | "label_batch"}` records a correction or a delayed label. |
+| F4 | `POST /feedback` `{complaint_id, true_queue, source: "analyst" \| "label_batch"}` records a correction or a delayed label. |
 | F5 | `GET /health` (liveness) and `GET /ready` (readiness: model loaded, feature store reachable). |
 | F6 | A batch job scores a whole monthly partition (back-fill and monitoring), writing to the `predictions` table. |
 | F7 | Every prediction is logged with its inputs' hash, features used, model version and latency (§6.6). |
@@ -59,12 +59,12 @@ Three layers, kept apart. Optimizing vs satisficing is stated per metric.
 | Category | Requirement | Number or assumption |
 |---|---|---|
 | **Freshness** | Predictions are computed at request time from the request text (always fresh). Company-level features in the online store are refreshed daily. The model is retrained when a new monthly batch lands. | Online features ≤ 26 h old; model trained on data ≤ 45 days older than the latest batch. **Assumption:** monthly retraining is enough because complaint mix shifts over months, not hours. |
-| **Latency and throughput** | Synchronous online inference on CPU. | p95 ≤ 300 ms, p99 ≤ 800 ms at 10 requests/s sustained; batch scoring of one monthly partition (≈ 650 k rows) ≤ 30 min on the laptop. **Assumption:** 10 rps is ≈ 40× the 2026 average and covers a 10× business-hours peak. |
+| **Latency and throughput** | Synchronous online inference on CPU. | p95 ≤ 300 ms, p99 ≤ 800 ms at 10 requests/s sustained; batch scoring of one monthly partition (≤ 175 k narrative rows; the largest month is 2025-01 with 172 937, 2026 months have 10–22 k) ≤ 30 min on the laptop. **Assumption:** 10 rps is ≈ 43× the 2026 average and covers a 10× business-hours peak. |
 | **Availability and fallback** | If `router-api` is down, times out (> 1 s) or returns 5xx, the caller routes the ticket to the manual triage queue. If the online feature store is unreachable, the service answers using text-only features and marks `degraded: true`. | ≥ 99 % during the demo window. Fallback = manual triage, never "drop". |
 | **Reproducibility** | Any registered model is rebuilt from (git commit, DVC data version, config). Environment pinned by `uv.lock`; containers tagged with the commit SHA; random seeds fixed. | One command per model (`make train DATA_VERSION=…`), Lab 2. |
 | **Adaptability** | New data enters as a new monthly partition through the ingestion DAG; new models enter as MLflow registry versions with alias `challenger`, compared with `champion` on the latest held-out month; the serving image is not rebuilt to change a model, only the alias. A new queue requires a mapping change in `configs/queues.yaml` and a retrain. | New batch → candidate model within 1 day of landing. |
 | **Observability without ground truth** | Labels arrive ≈ 15 days late (§5.2). Until then, monitor input drift (text length, out-of-vocabulary rate, company mix), prediction drift (queue distribution PSI), confidence (mean, share below threshold), analyst override rate, and service metrics. | PSI on predicted-queue distribution > 0.2 or low-confidence share > 30 % over 7 days → alert. Macro-F1 on labelled data computed weekly once labels arrive. |
-| **Cost and resource ceilings** | Everything runs locally on one laptop: Minikube with 4 GB RAM, docker driver; GPU NVIDIA GTX 1650 Ti (4 GB VRAM) only for the optional Lab 3 local LLM. Cloud estimate in §6.7. | Training a candidate ≤ 15 min on CPU, ≤ 8 GB RAM; raw data subset ≤ 5 GB on disk. **Assumption:** the laptop has 16 GB RAM; if not, the training window shrinks (§5.2). LLM spend ≤ $10/month. |
+| **Cost and resource ceilings** | Everything runs locally on one laptop: Minikube with 4 GB RAM, docker driver; GPU NVIDIA GTX 1650 Ti (4 GB VRAM) only for the optional Lab 3 local LLM. Cloud estimate in §6.7. | Training a candidate ≤ 15 min on CPU, ≤ 8 GB RAM; raw data ≤ 10 GB on disk (the full archive is 1.37 GB zipped, 9.3 GB as CSV). The laptop has 32 GB RAM and an Intel i7-10750H (measured); Minikube still gets only 4 GB so the data stack fits beside it. LLM spend ≤ $10/month. |
 
 ### 4.1 In scope and out of scope
 
@@ -100,18 +100,18 @@ The 9 queues are a consolidation of the CFPB `Product` field, mapped in `configs
 | `MORTGAGE` | Mortgage |
 | `STUDENT_LOAN` | Student loan |
 | `VEHICLE_LOAN` | Vehicle loan or lease |
-| `CONSUMER_LOAN` | Payday / title / personal loan; Consumer loan; Debt or credit management |
-| `PAYMENTS` | Money transfer, virtual currency, or money service; Money transfers |
+| `CONSUMER_LOAN` | Payday loan; Payday loan, title loan, or personal loan; Payday loan, title loan, personal loan, or advance loan; Consumer Loan; Debt or credit management |
+| `PAYMENTS` | Money transfer, virtual currency, or money service; Money transfers; Virtual currency |
 
-**Assumption:** the exact product strings differ across years because the CFPB renamed categories over time; the mapping is matched by pattern and checked against every distinct `Product` value of the export in Lab 2. Any unmapped value fails the quality gate.
+The product strings differ across years because the CFPB renamed categories over time. The archive contains **21 distinct `Product` values** (checked against every file); 20 of them map to a queue by pattern. The remaining one, `Other financial service`, has 292 narratives, all from 2015–2017, outside the training window; it is listed explicitly in a `drop` list of `configs/queues.yaml`. The quality gate fails on any value that is neither mapped nor in the `drop` list.
 
 **Rejected framing: hierarchical classification down to `issue`.** Predicting product and then issue would route more precisely, but the issue taxonomy has dozens of values, many with a few hundred examples, and it changes when the CFPB revises its forms — so labels would be sparse and unstable across the time split, and the evaluation would be dominated by taxonomy changes rather than by model quality. Product-level routing is what a triage desk needs first.
 
 ### 5.2 Data
 
-**Source.** CFPB Consumer Complaint Database Narratives Archive (FOIA electronic reading room, consumerfinance.gov). It holds complaints received from 1 December 2011 to 14 August 2026 that were published in the database, as zipped full-record exports (one file per period: several early multi-month files, then two-month files from 2024, then monthly files from March 2026). On 14 August 2026 the CFPB stopped publishing narratives in the live database, so **the archive is frozen**: no new narratives will appear. Licence: US government public data (public domain).
+**Source.** CFPB Consumer Complaint Database Narratives Archive (FOIA electronic reading room, consumerfinance.gov). It holds complaints received from 1 December 2011 to 14 August 2026 that were published in the database, as 21 zipped full-record CSV exports (one file per period: multi-month files of 3–77 months up to October 2024, two-month files from November 2024, monthly files from March 2026); 1.37 GB zipped, 9.3 GB unzipped, 17.5 M rows, of which **3 851 415 rows carry a narrative** (measured). Rows without a narrative are present too and are filtered out. On 14 August 2026 the CFPB stopped publishing narratives in the live database, so **the archive is frozen**: no new narratives will appear. Licence: US government public data (public domain).
 
-**Fields used** (CFPB export schema; exact column names confirmed in Lab 2): `Date received`, `Product` (→ label), `Consumer complaint narrative` (→ text), `Company`, `State`, `Tags`, `Submitted via`, `Complaint ID`; `Consumer consent provided?` only to filter rows that have a narrative. Dropped: `ZIP code` (privacy, §6.5). Excluded from features because they are not known at intake (leakage): `Sub-product`, `Issue`, `Sub-issue`, `Company response to consumer`, `Company public response`, `Timely response?`, `Consumer disputed?`, `Date sent to company`.
+**Fields used** (CFPB export schema; column names checked against all 21 archive files): `Date received`, `Product` (→ label), `Consumer complaint narrative` (→ text), `Company`, `State`, `Tags`, `Complaint ID`. The archive has 16 columns, identical in all files, and **no `Consumer consent provided?` column**: rows are kept when `Consumer complaint narrative` is non-empty. Dropped: `ZIP code` (privacy, §6.5); `Submitted via` (it is `Web` for all 3.85 M narrative rows, so it carries no signal). Excluded from features because they are not known at intake (leakage): `Sub-product`, `Issue`, `Sub-issue`, `Company response to consumer`, `Company public response`, `Timely response?`, `Consumer disputed?`, `Date sent to company`.
 
 **Arrival pattern.** Real: the CFPB published complaints nightly; a complaint appeared after the company responded or after 15 days, and its narrative after the company's public response or 60 days. In this system: **monthly batches replayed from the archive** — the ingestion DAG treats "now" as a simulated date and ingests the calendar month `YYYY-MM` that has just closed, by `Date received`.
 
@@ -121,19 +121,19 @@ The 9 queues are a consolidation of the CFPB `Product` field, mapped in `configs
 
 | Available | At serving time (one request) | At training time (archive) |
 |---|---|---|
-| Narrative, company, state, submitted_via, tags, date | Yes, in the request | Yes |
+| Narrative, company, state, tags, date | Yes, in the request | Yes |
 | Company-level aggregates (complaint counts, product mix) | Yes, from the **online** store, up to 26 h old | Yes, from the **offline** store with a point-in-time join |
 | Product label | No (that is the prediction) | Yes |
 | Issue, company response, timeliness | No | Yes — **excluded** to prevent leakage |
 
-**Volume and training window.** The archive contains millions of narratives (≈ 3.8 million with narratives were reported live in the database in August 2026). **Assumption:** training uses complaints received from 2023-01-01, stratified-downsampled to at most 300 000 rows per training run so a run fits the laptop; the raw monthly partitions are stored in full.
+**Volume and training window.** The archive contains 3 851 415 narratives, 2 645 239 of them received from 2023-01-01. **Assumption:** training uses complaints received from 2023-01-01, stratified-downsampled to at most 300 000 rows per training run so a run fits the laptop; the raw monthly partitions are stored in full.
 
 **Data checklist (step 1 of the lab)**
 
 | Item | Justification |
 |---|---|
-| **A time axis** | Every row has `Date received` (day precision). Batches are calendar months by `Date received`, which gives ≈ 140 monthly partitions in total. Because the archive ended on 2026-08-14, "the next month" is produced by *replaying* the archive with a simulated clock; the cost is that there is no genuinely unseen future and August 2026 is a partial month (it is dropped). The upside: real, documented drift already exists inside the archive (category renames, the 2024–2026 surge of credit-reporting complaints), so Lab 4 can replay real shifts as well as injected ones. |
-| **Enough history to hold out a period** | Narratives exist from March 2015 to August 2026 (≈ 11 years). Training: 2023-01 → 2025-12. Validation (model selection, threshold): 2026-01 → 2026-03. **Held-out test period: 2026-04 → 2026-07** (four full months, never used for any decision before the Lab 2 report). |
+| **A time axis** | Every row has `Date received` (day precision). Batches are calendar months by `Date received`: the archive spans 177 calendar months (2011-12 → 2026-08), 138 of which contain narratives (2015-03 → 2026-07). Because the archive ended on 2026-08-14, "the next month" is produced by *replaying* the archive with a simulated clock; the cost is that there is no genuinely unseen future, and August 2026 (1 narrative) is dropped. The upside: real drift already exists inside the archive (category renames, and a sharp break in January 2026, when the credit-reporting share of narratives fell from 58–81 % in each month of September 2024 – December 2025 to ≈ 4 %, and monthly narrative volume fell from 56–173 k to 10–22 k), so Lab 4 can replay real shifts as well as injected ones. |
+| **Enough history to hold out a period** | Narratives exist from 2015-03-19 to July 2026 (≈ 11.4 years). Training: 2023-01 → 2025-12 (2 523 845 narratives). Validation (model selection, calibration, threshold): 2026-01 → 2026-03 (55 991). **Held-out test period: 2026-04 → 2026-07** (65 402; four full months, never used for any decision before the Lab 2 report). Train and test sit on opposite sides of the January 2026 break (credit reporting is 75.0 % of training narratives, 3.9 % of validation, 4.2 % of test); see §5.4. |
 | **Labels with a known arrival delay** | Label = filed product category; in the simulation it arrives **15 days** after the complaint (assumption tied to the 15-day company-response window). Labels for a month are complete 15 days after it closes, which is when the monthly retrain is scheduled. |
 | **A text surface or a documented corpus** | The task is text: the narrative is the input. For Lab 3 retrieval the corpus is (1) the CFPB "Ask CFPB" consumer guidance articles and (2) the text of the regulations behind each queue from the eCFR — Regulation V / FCRA (credit reporting), Regulation F (debt collection), Regulation E (electronic transfers, payments), Regulation Z (credit cards, mortgages, loans), Regulation X (mortgage servicing), Regulation DD (deposit accounts). Both are public-domain US government text. |
 
@@ -149,7 +149,6 @@ The 9 queues are a consolidation of the CFPB `Product` field, mapped in `configs
 |---|---|---|
 | `narrative_tfidf` (word + char n-grams) | archive narrative, transformed by the fitted pipeline | request `narrative`, transformed by **the same pipeline object** packaged in the model artifact |
 | `narrative_len_chars`, `has_dollar_amount`, `redaction_ratio` (share of `XXXX` tokens) | computed from archive narrative by `features/text.py` | computed from request `narrative` by the **same function**, inside `router-api` |
-| `submitted_via` (one-hot) | archive column | request field |
 | `state` (one-hot, 50 states + other) | archive column | request field |
 | `tag_older_american`, `tag_servicemember` | archive `Tags` | request `tags` |
 | `company_complaints_30d` | Feast **offline** store (Parquet on MinIO), point-in-time join on `company` and `date_received` | Feast **online** store (PostgreSQL), materialized daily by Airflow; up to 26 h old |
@@ -160,7 +159,9 @@ The 9 queues are a consolidation of the CFPB `Product` field, mapped in `configs
 
 ### 5.4 Experimentation and validation
 
-**Split strategy — by time, never random.** Complaints arrive over time and the vocabulary and mix drift; a random split would let the model see the future's vocabulary and the same template complaints on both sides, and the company aggregates would leak labels across the split. Splits: train 2023-01 → 2025-12, validation 2026-01 → 2026-03, test 2026-04 → 2026-07 (§5.2). For robustness, a **rolling-origin backtest**: three folds, each training on everything before month *m* and testing on month *m* (*m* = 2026-01, 2026-02, 2026-03), reported as mean ± spread. Near-duplicate narratives (MinHash similarity > 0.9) are kept in only one side of each split.
+**Split strategy — by time, never random.** Complaints arrive over time and the vocabulary and mix drift; a random split would let the model see the future's vocabulary and the same template complaints on both sides, and the company aggregates would leak labels across the split. Splits: train 2023-01 → 2025-12, validation 2026-01 → 2026-03, test 2026-04 → 2026-07 (§5.2). For robustness, a **rolling-origin backtest**: three folds, each training on everything before month *m* and testing on month *m* (*m* = 2026-01, 2026-02, 2026-03), reported as mean ± spread. Near-duplicate narratives (MinHash similarity > 0.9) are kept in only one side of each split; this matters because 41 % of narratives received from 2023 (1 093 632 of 2 645 239) are exact copies of another narrative (measured).
+
+**The January 2026 break.** The class mix of the archive changes abruptly between training and the later periods: `CREDIT_REPORTING` is 75.0 % of training narratives but 3.9 % of validation and 4.2 % of test (measured; the archive does not document the cause). Three consequences for validation: probabilities are calibrated and the auto-routing threshold is chosen on the validation period, which lies after the break; macro-F1 and per-queue recall, not accuracy, are the gates, because they do not reward predicting the formerly dominant class; and the champion/challenger comparison always uses the most recent labelled month, never the training period.
 
 **Offline metrics.** Primary: macro-F1 over the 9 queues. Secondary: per-queue recall, weighted F1, and the **automation rate at ≤ 5 % misrouting** obtained by sweeping the threshold on validation and applying it unchanged to test — the offline estimate of the business metric.
 
@@ -325,7 +326,7 @@ Libraries that run *inside* these components and therefore have no separate clou
 | `POST /route` end-to-end at the service | p95 ≤ 300 ms, p99 ≤ 800 ms | TF-IDF + logistic regression predicts in ~1–10 ms on CPU (**assumption**, measured in Lab 4); Feast online lookup ≤ 30 ms (PostgreSQL, one key); remaining budget for JSON parsing, logging (async) and network. |
 | Throughput | 10 requests/s sustained, 1 replica | One uvicorn worker per CPU core; Lab 4 load-tests with locust/hey. |
 | Online feature materialization | daily, ≤ 10 min | Only the `company` entity (≈ a few thousand companies). |
-| `score_month` batch | ≤ 30 min for ≈ 650 k rows | Vectorized `predict_proba` in chunks of 50 k. |
+| `score_month` batch | ≤ 30 min for ≤ 175 k rows (largest month of narratives: 2025-01, 172 937) | Vectorized `predict_proba` in chunks of 50 k. |
 | Retraining (`train` DAG) | ≤ 15 min on CPU, ≤ 8 GB RAM | ≤ 300 k training rows (§5.2), sparse matrices. |
 | LLM triage note (Lab 3, asynchronous, not on the routing path) | p95 ≤ 5 s | Called after routing; never blocks `/route`. |
 
@@ -337,7 +338,7 @@ Libraries that run *inside* these components and therefore have no separate clou
 
 ### 6.5 Data privacy
 
-- **What personal data the dataset contains:** the CFPB publishes narratives only with the consumer's opt-in consent and removes direct identifiers (names, account numbers, SSNs appear redacted as `XXXX`). Remaining quasi-identifiers: 5-digit ZIP code, state, tags (*Older American*, *Servicemember*), company, dates, and free text that may still contain identifying details the redaction missed.
+- **What personal data the dataset contains:** the CFPB publishes narratives only with the consumer's opt-in consent and removes direct identifiers (names, account numbers, SSNs appear redacted as `XXXX`; 68 % of archive narratives contain at least one `XXXX`). Remaining quasi-identifiers: 5-digit ZIP code, state, tags (*Older American*, *Servicemember*), company, dates, and free text that may still contain identifying details the redaction missed.
 - **What we do:** drop `ZIP code` at preprocessing; run a regex scrubber for e-mails, phone numbers, long digit strings and URLs before text reaches the clean layer; keep `state` and tags (needed as features); log the request narrative only as a hash plus length in `prediction_log`, not as text.
 - **Retention:** raw archive partitions are kept for the duration of the course plus the defense, **until 2027-02-28**, then deleted from MinIO and the DVC remote; the clean and feature layers follow the raw data. Prediction logs are kept 90 days.
 - **Usage:** the data is public-domain government data used for coursework; the unverified, one-sided nature of narratives (the reason the CFPB gave for ending publication) is acknowledged — the system routes complaints, it does not judge companies.
@@ -405,14 +406,14 @@ Estimated monthly cost if the same system ran on **AWS, us-east-1, on-demand, 73
 | Risk | Mitigation |
 |---|---|
 | **The source is frozen** (no narratives after 2026-08-14), so there is no genuinely new data. | Replay the archive with a simulated clock; inject synthetic shifts in Lab 4 on top of the real historical ones; document that "next month" is a replayed month. |
-| **Class imbalance and composition shift**: credit-reporting complaints dominate 2024–2026 and may include large volumes of templated submissions (the CFPB itself raised concerns about abuse of the complaint system in 2026). | `class_weight="balanced"`, per-queue recall guard (§3), MinHash near-duplicate detection with a cap per template, monitoring of the duplicate share as a data-quality metric. |
+| **Class imbalance and composition shift**: credit-reporting complaints are 75 % of the 2023–2025 training narratives and then fall to ≈ 4 % from January 2026; 41 % of 2023+ narratives are exact duplicates, consistent with templated submissions (the CFPB itself raised concerns about abuse of the complaint system in 2026). | `class_weight="balanced"`, per-queue recall guard (§3), MinHash near-duplicate detection with a cap per template, monitoring of the duplicate share as a data-quality metric. |
 | **Taxonomy renames** of `Product` across years break the label mapping. | Pattern-based mapping in `configs/queues.yaml`; the quality gate fails on any unmapped value; training window starts 2023 to reduce exposure. |
 | **Label noise**: the label is the category the consumer filed under, which can be wrong. | Manually audit 200 random complaints in Lab 2 to estimate the noise rate; report metrics with that caveat; analyst overrides become higher-quality labels. |
 | **Training–serving skew** in `company_*` features (online values up to 26 h old vs point-in-time offline values) or in text preprocessing. | One packaged sklearn pipeline used by both training and `router-api`; feature definitions only in the Feast repo; Lab 4 compares a sample of online vs offline values daily. |
 | **Selection bias**: only consented narratives are published, so the data is not a random sample of all complaints. | State it in the README and model card; do not claim performance on non-narrative complaints. |
 | **Residual PII** in free text. | Regex scrubber at preprocessing, narrative not stored in logs, retention deadline (§6.5). |
 | **Laptop resources**: Minikube 4 GB plus Airflow, PostgreSQL, MinIO, MLflow; GPU only 4 GB VRAM. | Docker Compose for the data stack, Minikube only for serving; training subsample ≤ 300 k rows; Lab 3 LLM through an API by default, local vLLM only with a ≤ 1.5 B model in fp16. |
-| **Dataset size** of the full archive (several GB zipped; exact size unknown until downloaded). | Ingest per export file, filter to 2023+ immediately, store Parquet (columnar, compressed). |
+| **Dataset size** of the full archive: 21 ZIP files, 1.37 GB zipped, 9.3 GB as CSV, 17.5 M rows (measured). | Ingest per export file, filter to 2023+ immediately, store Parquet (columnar, compressed). |
 
 ---
 
