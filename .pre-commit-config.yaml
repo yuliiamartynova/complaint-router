@@ -1,4 +1,4 @@
-# Runs the same linter as `make lint` and CI, using the ruff version pinned in uv.lock.
+# Same check as make lint, using the ruff version from uv.lock.
 repos:
   - repo: local
     hooks:
